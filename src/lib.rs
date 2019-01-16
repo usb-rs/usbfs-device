@@ -1,4 +1,4 @@
-//! A wrapper for the Linux _USB Filesystem_.
+//! A wrapper for the Linux [USB Filesystem](https://kernel.readthedocs.io/en/sphinx-samples/usb.html#the-usb-filesystem-usbfs).
 #![deny(rust_2018_idioms, future_incompatible, missing_docs)]
 
 use std::io;
@@ -165,12 +165,13 @@ impl DeviceHandle {
     }
 */
     fn poll_reap(&self) -> futures::Poll<UrbWrap, io::Error> {
-        futures::try_ready!(self.io.poll_read_ready(mio::Ready::readable()));
-
+        // oddly, we need to poll for write-readiness to determine if we can reap a URB response
+        futures::try_ready!(self.io.poll_write_ready());
+        // TODO: loop until EAGAIN?
         match self.reap_ndelay() {
             Ok(ret) => Ok(futures::Async::Ready(ret)),
             Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => {
-                self.io.clear_read_ready(mio::Ready::readable())?;
+                self.io.clear_write_ready()?;
                 Ok(futures::Async::NotReady)
             }
             Err(nix::Error::Sys(e)) => Err(io::Error::from(e)),
@@ -583,7 +584,7 @@ mod test {
     use std::path::Path;
     use futures::future::Future;
 
-    const DEV_PATH: &str = "/dev/bus/usb/001/056";
+    const DEV_PATH: &str = "/dev/bus/usb/001/011";
 
     #[test]
     fn reset() {
@@ -628,6 +629,8 @@ mod test {
 
     #[test]
     fn future() {
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+
         let dev = DeviceHandle::new_from_path(Path::new(DEV_PATH)).unwrap();
         {
             let iface = dev.interface(0);
@@ -643,8 +646,8 @@ mod test {
                 data: vec![0x09],
             };
             ctl_pipe.submit(req).unwrap();
-            //std::thread::sleep(std::time::Duration::from_millis(500));
         }
+
 
         let future = dev
             .reap()
@@ -654,7 +657,11 @@ mod test {
             .map_err(|e| {
                 eprintln!("failed: {:?}", e);
             });
-        tokio::run(future);
+        runtime.spawn(future);
+        runtime
+            .shutdown_on_idle()
+            .wait()
+            .unwrap();
     }
 }
 
