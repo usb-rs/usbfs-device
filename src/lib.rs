@@ -475,59 +475,54 @@ impl<'dev> ControlPipe<'dev> {
     /// TODO: In order to see the result, ...
     ///
     /// Implemented in terms of the `USBDEVFS_SUBMITURB` ioctl.
-    pub fn submit(&self, req: ControlRequest /*, callback: CB*/) -> Result<(), io::Error>
+    pub fn submit(&self, req: ControlRequest /*, callback: CB*/) -> Result<ResponseFuture, io::Error>
         //where CB: Fn(Result<UrbWrap,nix::Error>) + 'static
     {
         if req.data.len() > std::i16::MAX as usize - Self::SETUP_LEN {
             return Err(io::Error::new(io::ErrorKind::Other, "input too large"))
         }
 
-        let mut result = Ok(());
-        let result_p = &mut result;
-        //self.dev.add_completion(|id| {
-            let mut data = Vec::with_capacity(req.data.len() + Self::SETUP_LEN);
-            data.write_u8(req.usb_request_type()).unwrap();
-            data.write_u8(req.request).unwrap();
-            data.write_u16::<LittleEndian>(req.value).unwrap();
-            data.write_u16::<LittleEndian>(req.index).unwrap();
-            data.write_u16::<LittleEndian>(req.data.len() as u16).unwrap();
-            // TODO: pointless to copy the arg if this is a read,
-            data.extend_from_slice(&req.data[..]);
-            let buffer_length = data.len() as i32;
-            let mut data = data;
-            let id = 1;  // TODO
-            let request = Box::new(usbfs_sys::types::urb {
-                type_: usbfs_sys::types::URB_TYPE_CONTROL,
-                endpoint: self.endpoint | USB_DIR_OUT,
-                status: 0,
-                flags: 0,
-                buffer: data.as_mut_ptr() as *mut std::ffi::c_void,
-                buffer_length,
-                actual_length: 0,
-                start_frame: 0,
-                __bindgen_anon_1: usbfs_sys::types::urb__bindgen_ty_1 { number_of_packets: 0 },
-                error_count: 0,
-                signr: 0,
-                usercontext: id as *mut std::ffi::c_void,
-                iso_frame_desc: usbfs_sys::types::__IncompleteArrayField::new()
-            });
+        let mut data = Vec::with_capacity(req.data.len() + Self::SETUP_LEN);
+        data.write_u8(req.usb_request_type()).unwrap();
+        data.write_u8(req.request).unwrap();
+        data.write_u16::<LittleEndian>(req.value).unwrap();
+        data.write_u16::<LittleEndian>(req.index).unwrap();
+        data.write_u16::<LittleEndian>(req.data.len() as u16).unwrap();
+        // TODO: pointless to copy the arg if this is a read,
+        data.extend_from_slice(&req.data[..]);
+        let buffer_length = data.len() as i32;
+        let mut data = data;
+        let id = 1;  // TODO
+        let request = Box::new(usbfs_sys::types::urb {
+            type_: usbfs_sys::types::URB_TYPE_CONTROL,
+            endpoint: self.endpoint | USB_DIR_OUT,
+            status: 0,
+            flags: 0,
+            buffer: data.as_mut_ptr() as *mut std::ffi::c_void,
+            buffer_length,
+            actual_length: 0,
+            start_frame: 0,
+            __bindgen_anon_1: usbfs_sys::types::urb__bindgen_ty_1 { number_of_packets: 0 },
+            error_count: 0,
+            signr: 0,
+            usercontext: id as *mut std::ffi::c_void,
+            iso_frame_desc: usbfs_sys::types::__IncompleteArrayField::new()
+        });
 
-            std::mem::forget(data);  // 😦 hopefully handled by impl Drop for UrbWrap
+        std::mem::forget(data);  // 😦 hopefully handled by impl Drop for UrbWrap
 
-            match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd(), Box::into_raw(request)) } {
-                Err(e) => {
-                    *result_p = Err(io::Error::new(io::ErrorKind::Other, format!("submiturb: {:?}", e)));
-                    //None
-                },
-                Ok(_) => {
-                    //Some(Completion {
-                    //    callback: Box::new(callback),
-                    //})
-                },
-            }
-        //});
-        result
+        match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd(), Box::into_raw(request)) } {
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("submiturb: {:?}", e))),
+            Ok(_) => Ok(ResponseFuture {
+
+            }),
+        }
     }
+}
+
+/// TODO!
+pub struct ResponseFuture {
+
 }
 
 /// Wrapper around a URB result value
@@ -647,7 +642,6 @@ mod test {
             };
             ctl_pipe.submit(req).unwrap();
         }
-
 
         let future = dev
             .reap()
