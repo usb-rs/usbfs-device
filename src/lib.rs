@@ -14,6 +14,12 @@ use std::path::Path;
 //use std::cell::RefCell;
 //use std::collections::HashMap;
 use byteorder::{LittleEndian, WriteBytesExt};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use futures::future::Future;
+use std::rc::Rc;
+use std::cell::RefMut;
+use core::borrow::BorrowMut;
 
 // TODO: derive using bindgen?
 const USB_DIR_OUT: u8 = 0x00;
@@ -25,11 +31,11 @@ const USB_DIR_IN: u8 = 0x80;
 struct Completion {
     callback: Box<dyn Fn(Result<UrbWrap, nix::Error>)>,
 }
-
+*/
 struct CompletionSet {
     completion_seq: usize,
     // TODO: other containers?  e.g. slab?
-    completions: HashMap<usize, Completion>
+    completions: HashMap<usize, futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>>
 }
 impl Default for CompletionSet {
     fn default() -> Self {
@@ -39,7 +45,7 @@ impl Default for CompletionSet {
         }
     }
 }
-*/
+
 
 struct DeviceInner {
     fd: RawFd,
@@ -71,11 +77,15 @@ impl mio::Evented for DeviceInner {
     }
 }
 
-/// User-space control over a particular USB device.
-pub struct DeviceHandle {
+struct DevPrivate {
     io: tokio::reactor::PollEvented2<DeviceInner>,
-    //completions: RefCell<CompletionSet>
+    completions: RefCell<CompletionSet>,
+    closed: RefCell<bool>,
 }
+
+/// User-space control over a particular USB device.
+#[derive(Clone)]
+pub struct DeviceHandle(Rc<DevPrivate>);
 impl DeviceHandle {
     /// Creates a new `DeviceHandle` instances from a filesystem path.
     ///
@@ -91,39 +101,45 @@ impl DeviceHandle {
     }
     fn new(fd: RawFd) -> DeviceHandle {
         let inner = DeviceInner { fd };
-        DeviceHandle {
+        DeviceHandle(Rc::new(DevPrivate {
             io: tokio::reactor::PollEvented2::new(inner),
-            //completions: RefCell::new(CompletionSet::default()),
-        }
+            completions: RefCell::new(CompletionSet::default()),
+            closed: RefCell::new(false),
+        }))
     }
-    /*
-        fn add_completion<F>(&self, f: F)
-        where
-            F: FnOnce(usize)->Option<Completion>
-        {
-            let mut completions = self.completions.borrow_mut();
-            completions.completion_seq += 1;
-            let seq = completions.completion_seq;
-            if let Some(completion) = f(seq) {
-                completions.completions.insert(seq, completion);
-            }
-        }
-    */
-    fn capabilities(&self) -> Result<Capabilities, ()> {
-        let mut caps: usbfs_sys::types::__u32 = 0;
-        match unsafe { usbfs_sys::ioctl::get_capabilities(self.fd(), &mut caps) } {
-            Err(e) => panic!("TODO {:?}", e),
-            Ok(_) => Ok(Capabilities::from_bits_truncate(caps)),
+
+    fn io(&self) -> nix::Result<&tokio::reactor::PollEvented2<DeviceInner>> {
+        if *self.0.closed.borrow() {
+            Err(nix::Error::Sys(nix::errno::Errno::EBADF))
+        } else {
+            Ok(&self.0.io)
         }
     }
 
-    fn read_descriptors(&self) -> Result<(), io::Error> {
-        let mut f = unsafe { fs::File::from_raw_fd(self.fd()) };
-        let mut buf = vec![];
-        f.read_to_end(&mut buf)?;
-        // seek back to the start of the file, in case another read is performed later
-        f.seek(SeekFrom::Start(0))?;
-        Ok(())
+    fn completions(&self) -> nix::Result<&RefCell<CompletionSet>> {
+        if *self.0.closed.borrow() {
+            Err(nix::Error::Sys(nix::errno::Errno::EBADF))
+        } else {
+            Ok(&self.0.completions)
+        }
+    }
+
+    fn add_completion(&self, id: usize, sender: futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>)
+    {
+        match self.completions() {
+            Ok(completions) => {
+                completions.borrow_mut().completions.insert(id, sender);
+            },
+            Err(e) => panic!("DeviceHandle already closed"),
+        }
+    }
+
+    fn capabilities(&self) -> nix::Result<Capabilities> {
+        let mut caps: usbfs_sys::types::__u32 = 0;
+        match unsafe { usbfs_sys::ioctl::get_capabilities(self.fd()?, &mut caps) } {
+            Err(e) => Err(e),
+            Ok(_) => Ok(Capabilities::from_bits_truncate(caps)),
+        }
     }
 
     /// Obtain a reference to the given interface of the USB device, in an 'unclaimed' state.
@@ -134,12 +150,9 @@ impl DeviceHandle {
     // take `&mut self` so that no objects with borrowed references to self may exist when this is
     // called (because a reset would potentially invalidate those objects in any case).
     /// Ask the kernel to perform a USB bus reset on this device
-    pub fn reset(&mut self) -> Result<(), io::Error> {
-        match unsafe { usbfs_sys::ioctl::reset(self.fd()) } {
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("reset: {:?}", e),
-            )),
+    pub fn reset(&mut self) -> nix::Result<()> {
+        match unsafe { usbfs_sys::ioctl::reset(self.fd()?) } {
+            Err(e) => Err(e),
             Ok(_) => Ok(()),
         }
     }
@@ -150,7 +163,7 @@ impl DeviceHandle {
             len,
             nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_READ,
             nix::sys::mman::MapFlags::MAP_SHARED,
-            self.fd(),
+            self.fd()?,
             0,
         )
     }
@@ -158,31 +171,22 @@ impl DeviceHandle {
     /// Used to 'harvest' a URB previously submitted to an endpoint pipe
     pub fn reap_ndelay(&self) -> nix::Result<UrbWrap> {
         let mut urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
-        match unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd(), &mut urb_p) } {
+        match unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &mut urb_p) } {
             Err(e) => Err(e),
             Ok(_) => Ok(UrbWrap(unsafe {
                 Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
             })),
         }
     }
-    /*
-        /// Used to 'harvest' a URB previously submitted to an endpoint pipe
-        pub fn reap_cb(&self) -> nix::Result<()> {
-            let mut urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
-            loop {
-                let urb = self.reap_ndelay()?;
-                self.dispatch(urb)?;
-            }
-        }
-    */
+
     fn poll_reap(&self) -> futures::Poll<UrbWrap, io::Error> {
         // oddly, we need to poll for write-readiness to determine if we can reap a URB response
-        futures::try_ready!(self.io.poll_write_ready());
+        futures::try_ready!(self.io().expect("TODO").poll_write_ready());
         // TODO: loop until EAGAIN?
         match self.reap_ndelay() {
             Ok(ret) => Ok(futures::Async::Ready(ret)),
             Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => {
-                self.io.clear_write_ready()?;
+                self.io().expect("TODO").clear_write_ready()?;
                 Ok(futures::Async::NotReady)
             }
             Err(nix::Error::Sys(e)) => Err(io::Error::from(e)),
@@ -193,6 +197,42 @@ impl DeviceHandle {
     pub fn reap(self) -> Reap {
         Reap { dev: Some(self) }
     }
+
+    /// arrange for URB completions to be handle on the event loop of the given `Runtime`.
+    pub fn spawn_onto(&self, runtime: &mut tokio::runtime::current_thread::Runtime) {
+        // TODO: terminate stream when dev is dropped
+        runtime.spawn(futures::future::loop_fn((*self).clone(), |dev| {
+            dev.reap()
+                .and_then(|(urb, dev)| {
+                    dev.dispatch(urb);
+                    futures::future::ok(dev)
+                })
+                .then(|result| {
+                    match result {
+                        Ok(dev) => futures::future::ok(futures::future::Loop::Continue(dev)),
+                        Err(e) => futures::future::ok(futures::future::Loop::Break(())),
+                    }
+                })
+        }));
+    }
+
+    fn dispatch(&self, urb: UrbWrap) -> nix::Result<()> {
+        let completions = self.completions()?;
+        let id = dbg!(urb.id());
+        let result = match urb.0.status {
+            0 => Ok(urb),
+            e => Err(nix::Error::Sys(nix::errno::Errno::from_i32(e)))
+        };
+        match completions.borrow_mut().completions.remove(&id) {
+            Some(c) => {
+                c.send(result).expect("Failed to send completed URB to handling Future");
+                Ok(())
+            },
+            None => panic!("No completion for id {}", id),
+        }
+
+    }
+
     /*
         fn dispatch(&self, urb: UrbWrap) -> nix::Result<()> {
             let mut completions = self.completions.borrow_mut();
@@ -208,8 +248,12 @@ impl DeviceHandle {
             Ok(())
         }
     */
-    fn fd(&self) -> RawFd {
-        self.io.get_ref().fd
+    fn fd(&self) -> nix::Result<RawFd> {
+        Ok(self.io()?.get_ref().fd)
+    }
+
+    fn close(self) {
+        *self.0.closed.borrow_mut() = false
     }
 }
 
@@ -218,7 +262,7 @@ pub struct Reap {
     dev: Option<DeviceHandle>,
 }
 impl futures::Future for Reap {
-    type Item = (DeviceHandle, UrbWrap);
+    type Item = (UrbWrap, DeviceHandle);
     type Error = io::Error;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
@@ -228,11 +272,11 @@ impl futures::Future for Reap {
                 .as_mut()
                 .expect("RecvDgram polled after completion");
 
-            futures::try_ready!(inner.poll_reap())
+            futures::try_ready!(dbg!(inner.poll_reap()))
         };
 
         let inner = self.dev.take().unwrap();
-        Ok(futures::Async::Ready((inner, urb)))
+        Ok(futures::Async::Ready((urb, inner)))
     }
 }
 
@@ -281,16 +325,13 @@ pub struct UnclaimedInterface<'dev> {
 }
 impl<'dev> UnclaimedInterface<'dev> {
     /// returns the name of the driver currently attached to the interface.
-    pub fn driver(&self) -> Result<Driver, io::Error> {
+    pub fn driver(&self) -> nix::Result<Driver> {
         let mut driver = usbfs_sys::types::getdriver {
             interface: self.iface,
             driver: [0; usbfs_sys::types::MAXDRIVERNAME as usize + 1],
         };
-        match unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd(), &mut driver) } {
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("getdriver: {:?}", e),
-            )),
+        match unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd()?, &mut driver) } {
+            Err(e) => Err(e),
             Ok(_) => {
                 // TODO: safety in face of the buffer failing to contain a nul byte?
                 let driver_name = unsafe { ffi::CStr::from_ptr(driver.driver.as_ptr()) }
@@ -313,7 +354,7 @@ impl<'dev> UnclaimedInterface<'dev> {
     pub fn disconnect_claim(
         self,
         disconnect: DisconnectOptions<'_>,
-    ) -> Result<ClaimedInterface<'dev>, io::Error> {
+    ) -> nix::Result<ClaimedInterface<'dev>> {
         let mut request = usbfs_sys::types::disconnect_claim {
             interface: self.iface,
             flags: 0,
@@ -337,11 +378,8 @@ impl<'dev> UnclaimedInterface<'dev> {
                 reconnect = recon;
             }
         }
-        match unsafe { usbfs_sys::ioctl::disconnect_claim(self.dev.fd(), &mut request) } {
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("disconnect_claim: {:?}", e),
-            )),
+        match unsafe { usbfs_sys::ioctl::disconnect_claim(self.dev.fd()?, &mut request) } {
+            Err(e) => Err(e),
             Ok(_) => Ok(ClaimedInterface {
                 dev: self.dev,
                 iface: self.iface,
@@ -362,19 +400,24 @@ pub struct ClaimedInterface<'dev> {
 }
 impl<'dev> Drop for ClaimedInterface<'dev> {
     fn drop(&mut self) {
-        /*        let mut iface = self.iface;
-                match unsafe { usbfs_sys::ioctl::releaseinterface(self.dev.fd(), &mut iface) } {
-                    Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-                    Ok(_) => (),
-                }
-                if self.reconnect == ReconnectOptions::ReconnectOnRelease {
-                    match unsafe { usbfs_sys::ioctl::connect(self.dev.fd(), iface as i32) } {
-                        Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-                        Ok(_) => (),
-                    }
+        let mut iface = self.iface;
+        let fd = if let Ok(fd) = self.dev.fd() {
+            fd
+        } else {
+            // TODO: probably we do still want to release though!
+            return;
+        };
+        match unsafe { usbfs_sys::ioctl::releaseinterface(fd, &mut iface) } {
+            Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
+            Ok(_) => (),
+        }
+        if self.reconnect == ReconnectOptions::ReconnectOnRelease {
+            match unsafe { usbfs_sys::ioctl::connect(fd, iface as i32) } {
+                Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
+                Ok(_) => (),
+            }
 
-                }
-        */
+        }
     }
 }
 impl<'dev> ClaimedInterface<'dev> {
@@ -495,12 +538,11 @@ impl<'dev> ControlPipe<'dev> {
     /// Implemented in terms of the `USBDEVFS_SUBMITURB` ioctl.
     pub fn submit(
         &self,
-        req: ControlRequest, /*, callback: CB*/
-    ) -> Result<ResponseFuture, io::Error>
-//where CB: Fn(Result<UrbWrap,nix::Error>) + 'static
+        req: ControlRequest,
+    ) -> nix::Result<ResponseFuture>
     {
         if req.data.len() > std::i16::MAX as usize - Self::SETUP_LEN {
-            return Err(io::Error::new(io::ErrorKind::Other, "input too large"));
+            return Err(nix::Error::Sys(nix::errno::Errno::EINVAL));
         }
 
         let mut data = Vec::with_capacity(req.data.len() + Self::SETUP_LEN);
@@ -535,18 +577,35 @@ impl<'dev> ControlPipe<'dev> {
 
         std::mem::forget(data); // 😦 hopefully handled by impl Drop for UrbWrap
 
-        match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd(), Box::into_raw(request)) } {
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("submiturb: {:?}", e),
-            )),
-            Ok(_) => Ok(ResponseFuture {}),
+        match dbg!(unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request)) }) {
+            Err(e) => Err(e),
+            Ok(_) => {
+                let (sender, receiver) = futures::unsync::oneshot::channel();
+                self.dev.add_completion(id, sender);
+                Ok(ResponseFuture { receiver })
+            },
         }
     }
 }
 
-/// TODO!
-pub struct ResponseFuture {}
+pub struct ResponseFuture {
+    receiver: futures::unsync::oneshot::Receiver<nix::Result<UrbWrap>>,
+}
+impl futures::Future for ResponseFuture {
+    type Item = UrbWrap;
+    type Error = nix::Error;
+
+    fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
+        match dbg!(self.receiver.poll()) {
+            Ok(futures::Async::Ready(urb_result)) => match urb_result {
+                Ok(urb) => Ok(futures::Async::Ready(urb)),
+                Err(e) => Err(e),
+            }
+            Ok(futures::Async::NotReady) => Ok(futures::Async::NotReady),
+            Err(e) => panic!("onshot cancelled: {:?}", e),  // TODO: don't panic is can really happen
+        }
+    }
+}
 
 /// Wrapper around a URB result value
 ///
@@ -608,7 +667,7 @@ mod test {
     use futures::future::Future;
     use std::path::Path;
 
-    const DEV_PATH: &str = "/dev/bus/usb/001/011";
+    const DEV_PATH: &str = "/dev/bus/usb/001/008";
 
     #[test]
     fn reset() {
@@ -668,39 +727,46 @@ mod test {
 
     #[test]
     fn future() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut runtime = tokio::runtime::current_thread::Runtime::new()
+            .unwrap();
 
         let dev = DeviceHandle::new_from_path(Path::new(DEV_PATH)).unwrap();
-        {
-            let iface = dev.interface(0);
-            let claimed = iface
-                .disconnect_claim(DisconnectOptions::DisconnectIf(
-                    "dvb_usb_rtl28xxu",
-                    ReconnectOptions::StayDisconnectedOnRelease,
-                ))
-                .unwrap();
-            let ctl_pipe = claimed.endpoint_control(0);
-            let req = ControlRequest {
-                direction: TransferDirection::HostToDevice,
-                req_type: ReqType::Vendor,
-                recipient: Recipient::Interface,
-                request: 0x00,
-                value: 0x3001,
-                index: 0x0210,
-                data: vec![0x09],
-            };
-            ctl_pipe.submit(req).unwrap();
-        }
+        dev.spawn_onto(&mut runtime);
 
-        let future = dev
-            .reap()
-            .map(|(dev, urb)| {
-                println!("gotz URB {:?}", urb);
+        let iface = dev.interface(0);
+        let claimed = iface
+            .disconnect_claim(DisconnectOptions::DisconnectIf(
+                "dvb_usb_rtl28xxu",
+                ReconnectOptions::StayDisconnectedOnRelease,
+            ))
+            .unwrap();
+        let ctl_pipe = claimed.endpoint_control(0);
+        let req = ControlRequest {
+            direction: TransferDirection::HostToDevice,
+            req_type: ReqType::Vendor,
+            recipient: Recipient::Interface,
+            request: 0x00,
+            value: 0x3001,
+            index: 0x0210,
+            data: vec![0x09],
+        };
+        let dev = dev.clone();
+        let response = ctl_pipe
+            .submit(req)
+            .unwrap()
+            .map(|urb| {
+                println!("response gotz URB {:?}", urb);
             })
             .map_err(|e| {
-                eprintln!("failed: {:?}", e);
-            });
-        runtime.spawn(future);
-        runtime.shutdown_on_idle().wait().unwrap();
+                println!("bag of fail {:?}", e);
+            })
+            .then(move |_| {
+                dev.close();
+                Ok(())
+            } );
+
+        runtime.spawn(response)
+            .run()
+            .expect("failure running spawned Future");
     }
 }
