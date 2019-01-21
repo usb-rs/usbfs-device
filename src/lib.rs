@@ -22,11 +22,6 @@ const USB_DIR_IN: u8 = 0x80;
 
 // TODO: if URBs aren't reap()'d, their memory leaks
 
-/*
-struct Completion {
-    callback: Box<dyn Fn(Result<UrbWrap, nix::Error>)>,
-}
-*/
 struct CompletionSet {
     completion_seq: usize,
     // TODO: other containers?  e.g. slab?
@@ -186,7 +181,7 @@ impl DeviceHandle {
         match unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &mut urb_p) } {
             Err(e) => Err(e),
             Ok(_) => Ok(UrbWrap(unsafe {
-                Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
+               Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
             })),
         }
     }
@@ -205,7 +200,7 @@ impl DeviceHandle {
         }
     }
     /// Returns a Future that will resolve to the next completed URB
-    pub fn reap(self) -> Reap {
+    fn reap(self) -> Reap {
         Reap { dev: Some(self) }
     }
 
@@ -287,7 +282,7 @@ impl DeviceHandle {
 }
 
 /// A future which will resolve to a completed USB Request Block (URB).
-pub struct Reap {
+struct Reap {
     dev: Option<DeviceHandle>,
 }
 impl futures::Future for Reap {
@@ -461,20 +456,6 @@ impl ClaimedInterface {
             endpoint,
         }
     }
-}
-
-/// The different types of endpoint a device may support
-pub enum EndpointType {
-    /// Bulk transfer endpoint that makes no guarantees of throughput or latency, but which can use
-    /// any free USB bandwith not used for other transfers.
-    Bulk,
-    /// Control endpoint for small control requests and responses.
-    Control,
-    /// Interrupt transfers with bounded latency but low throughput.
-    Interrupt,
-    /// Transfer type reserving a portion of USB bandwidth in order to provide throughbut and
-    /// latency guarentees (e.g. realtime streaming).
-    Isochronous,
 }
 
 /// The direction in which the request seeks to send data
