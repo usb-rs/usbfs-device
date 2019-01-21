@@ -232,7 +232,6 @@ impl DeviceHandle {
                             futures::future::ok((dev, close_receiver))
                         },
                         futures::future::Either::B(((), _)) => {
-                            dbg!("closed!");
                             // Fake-up an error to cause the Loop::Break varient to get produced
                             // below, ending the stream
                             futures::future::err(nix::Error::Sys(nix::errno::Errno::EIO))
@@ -272,7 +271,6 @@ impl DeviceHandle {
 
     /// Free the resources accociated with this device handle
     pub fn close(self) {
-        dbg!(&self.0.closed);
         *self.0.closed.borrow_mut() = true;
         if let Some(close_sender) = self.0.close_sender.borrow_mut().take() {
             if let Err(e) = close_sender.send(()) {
@@ -297,7 +295,7 @@ impl futures::Future for Reap {
                 .as_mut()
                 .expect("RecvDgram polled after completion");
 
-            futures::try_ready!(dbg!(inner.poll_reap()))
+            futures::try_ready!(inner.poll_reap())
         };
 
         let inner = self.dev.take().unwrap();
@@ -608,7 +606,7 @@ impl futures::Future for ResponseFuture {
     type Error = nix::Error;
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
-        match dbg!(self.receiver.poll()) {
+        match self.receiver.poll() {
             Ok(futures::Async::Ready(urb_result)) => match urb_result {
                 Ok(urb) => Ok(futures::Async::Ready(urb)),
                 Err(e) => Err(e),
