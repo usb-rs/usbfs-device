@@ -555,18 +555,23 @@ impl ControlPipe {
         }
 
         let mut data = Vec::with_capacity(req.data.len() + Self::SETUP_LEN);
-        data.write_u8(req.usb_request_type()).unwrap();
-        data.write_u8(req.request).unwrap();
-        data.write_u16::<LittleEndian>(req.value).unwrap();
-        data.write_u16::<LittleEndian>(req.index).unwrap();
-        data.write_u16::<LittleEndian>(req.data.len() as u16)
-            .unwrap();
-        // TODO: pointless to copy the arg if this is a read,
-        data.extend_from_slice(&req.data[..]);
-        let buffer_length = data.len() as i32;
-        let mut data = data;
+        ControlPipe::write_request(&req, &mut data);
         let id = self.dev.next_id();
-        let request = Box::new(usbfs_sys::types::urb {
+        let request = Box::new(self.create_urb(id, data));
+
+        match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request)) } {
+            Err(e) => Err(e),
+            Ok(_) => {
+                let (sender, receiver) = futures::unsync::oneshot::channel();
+                self.dev.add_completion(id, sender);
+                Ok(ResponseFuture { receiver })
+            },
+        }
+    }
+
+    fn create_urb(&self, id: usize, mut data: Vec<u8>) -> usbfs_sys::types::urb {
+        let buffer_length = data.len() as i32;
+        let result = usbfs_sys::types::urb {
             type_: usbfs_sys::types::URB_TYPE_CONTROL,
             endpoint: self.endpoint | USB_DIR_OUT,
             status: 0,
@@ -582,18 +587,22 @@ impl ControlPipe {
             signr: 0,
             usercontext: id as *mut std::ffi::c_void,
             iso_frame_desc: usbfs_sys::types::__IncompleteArrayField::new(),
-        });
+        };
 
         std::mem::forget(data); // 😦 hopefully handled by impl Drop for UrbWrap
 
-        match dbg!(unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request)) }) {
-            Err(e) => Err(e),
-            Ok(_) => {
-                let (sender, receiver) = futures::unsync::oneshot::channel();
-                self.dev.add_completion(id, sender);
-                Ok(ResponseFuture { receiver })
-            },
-        }
+        result
+    }
+
+    fn write_request(req: &ControlRequest, data: &mut Vec<u8>) {
+        data.write_u8(req.usb_request_type()).unwrap();
+        data.write_u8(req.request).unwrap();
+        data.write_u16::<LittleEndian>(req.value).unwrap();
+        data.write_u16::<LittleEndian>(req.index).unwrap();
+        data.write_u16::<LittleEndian>(req.data.len() as u16)
+            .unwrap();
+        // TODO: pointless to copy the arg if this is a read,
+        data.extend_from_slice(&req.data[..]);
     }
 }
 
