@@ -548,6 +548,14 @@ impl ControlPipe {
     pub fn submit(
         &self,
         req: ControlRequest,
+    ) -> impl Future<Item=UrbWrap, Error=nix::Error>
+    {
+        futures::future::result(self.submit_internal(req)).flatten()
+    }
+
+    fn submit_internal(
+        &self,
+        req: ControlRequest,
     ) -> nix::Result<ResponseFuture>
     {
         if req.data.len() > std::i16::MAX as usize - Self::SETUP_LEN {
@@ -749,7 +757,7 @@ mod test {
         let mut runtime = tokio::runtime::current_thread::Runtime::new()
             .unwrap();
 
-        let dev = DeviceHandle::new_from_path(Path::new(DEV_PATH)).unwrap();
+        let mut dev = DeviceHandle::new_from_path(Path::new(DEV_PATH)).unwrap();
         dev.spawn_onto(&mut runtime);
 
         let iface = dev.interface(0);
@@ -772,7 +780,6 @@ mod test {
         let dev = dev.clone();
         let response = ctl_pipe
             .submit(req)
-            .unwrap()
             .map(|urb| {
                 println!("response gotz URB {:?}", urb);
             })
