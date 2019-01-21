@@ -206,6 +206,7 @@ impl DeviceHandle {
 
     /// arrange for URB completions to be handle on the event loop of the given `Runtime`.
     pub fn spawn_onto(&mut self, runtime: &mut tokio::runtime::current_thread::Runtime) {
+        // TODO: return future instead, so that caller can define error handling before spawning
         let close_receiver = self.0.close_receiver.borrow_mut().take().expect("can't spawn DeviceHandle as second time");
         let dev = (*self).clone();
         runtime.spawn(futures::future::loop_fn((dev, close_receiver), |(dev, close_receiver)| {
