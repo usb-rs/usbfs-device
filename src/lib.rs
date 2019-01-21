@@ -228,7 +228,7 @@ impl DeviceHandle {
                 .and_then(|either| {
                     match either {
                         futures::future::Either::A(((urb, dev), close_receiver)) => {
-                            dev.dispatch(urb);
+                            dev.dispatch(urb).expect("TODO: dispatch() failed");
                             futures::future::ok((dev, close_receiver))
                         },
                         futures::future::Either::B(((), _)) => {
