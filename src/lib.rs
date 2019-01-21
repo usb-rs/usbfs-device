@@ -329,7 +329,7 @@ pub enum DisconnectOptions<'a> {
 }
 
 /// The name of the driver in use for a particular interface of the USB device.
-/// if the driver is `Driver::UsbFs`, then the interface is already claimed by _usbdeffs_ (whether
+/// if the driver is `Driver::UsbFs`, then the interface is already claimed by _usbdevfs_ (whether
 /// by the current process, or some other).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Driver {
@@ -612,7 +612,7 @@ impl futures::Future for ResponseFuture {
                 Err(e) => Err(e),
             }
             Ok(futures::Async::NotReady) => Ok(futures::Async::NotReady),
-            Err(e) => panic!("onshot cancelled: {:?}", e),  // TODO: don't panic is can really happen
+            Err(e) => panic!("onshot cancelled: {:?}", e),  // TODO: don't panic if can really happen
         }
     }
 }
