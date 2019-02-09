@@ -612,6 +612,22 @@ impl ControlPipe {
         // TODO: pointless to copy the arg if this is a read,
         data.extend_from_slice(&req.data[..]);
     }
+
+    /// Clears a _halt_ state on the endpoint.
+    ///
+    /// When an endpoint is hin halt state, no data will pass.
+    ///
+    /// The Kernel wants this to be signalled explicitly (rather than the application constructing
+    /// the URB to clear halt state itself) so that the kernel can track the state of the endpoint.
+    ///
+    /// *NB* this is a blocking operation.
+    pub fn clear_halt(&self) -> nix::Result<()> {
+        let mut val = self.endpoint as u32;
+        match unsafe { usbfs_sys::ioctl::clear_halt(self.dev.fd()?, &mut val) } {
+            Err(e) => Err(e),
+            Ok(_) => Ok(()),
+        }
+    }
 }
 
 /// TODO
