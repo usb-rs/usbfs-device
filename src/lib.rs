@@ -665,6 +665,8 @@ impl fmt::Debug for UrbWrap {
             .field("signr", &self.0.signr)
             .field("usercontext", &self.0.usercontext)
             .field("buffer_length", &self.0.buffer_length)
+            .field("actual_length", &self.0.actual_length)
+            .field("buffer", &self.0.buffer)
             .finish()
     }
 }
