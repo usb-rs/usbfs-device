@@ -531,6 +531,8 @@ impl ControlRequest {
     }
 }
 
+const SETUP_LEN: usize = 8;
+
 /// Commuinication channel to an endpoint on an interface of a USB device
 pub struct ControlPipe {
     dev: DeviceHandle,
@@ -538,8 +540,6 @@ pub struct ControlPipe {
     endpoint: u8,
 }
 impl ControlPipe {
-    const SETUP_LEN: usize = 8;
-
     /// Send a control request asynchronously to this endpoint.
     ///
     /// TODO: In order to see the result, ...
@@ -558,11 +558,11 @@ impl ControlPipe {
         req: ControlRequest,
     ) -> nix::Result<ResponseFuture>
     {
-        if req.data.len() > std::i16::MAX as usize - Self::SETUP_LEN {
+        if req.data.len() > std::i16::MAX as usize - SETUP_LEN {
             return Err(nix::Error::Sys(nix::errno::Errno::EINVAL));
         }
 
-        let mut data = Vec::with_capacity(req.data.len() + Self::SETUP_LEN);
+        let mut data = Vec::with_capacity(req.data.len() + SETUP_LEN);
         ControlPipe::write_request(&req, &mut data);
         let id = self.dev.next_id();
         let request = Box::new(self.create_urb(id, data));
@@ -657,11 +657,17 @@ impl UrbWrap {
     pub fn id(&self) -> usize {
         self.0.usercontext as usize
     }
-    /// The data bufer to which the URB refers.
+    /// The whole data bufer to which the URB refers, including _setup_ headers, and payload.
     pub fn data(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(self.0.buffer as *const u8, self.0.actual_length as usize)
+            std::slice::from_raw_parts(self.0.buffer as *const u8, self.0.buffer_length as usize)
         }
+    }
+
+    /// The payload part of the data buffer (after the SETUP headers, restricted to the actual
+    /// length returned in the device response)
+    pub fn payload(&self) -> &[u8] {
+        &self.data()[SETUP_LEN..SETUP_LEN+self.0.actual_length as usize]
     }
 }
 impl Drop for UrbWrap {
