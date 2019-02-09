@@ -250,7 +250,7 @@ impl DeviceHandle {
 
     fn dispatch(&self, urb: UrbWrap) -> nix::Result<()> {
         let completions = self.completions()?;
-        let id = dbg!(urb.id());
+        let id = urb.id();
         let result = match urb.0.status {
             0 => Ok(urb),
             e => Err(nix::Error::Sys(nix::errno::Errno::from_i32(e)))
