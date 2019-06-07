@@ -1,5 +1,9 @@
 //! A wrapper for the Linux [USB Filesystem](https://kernel.readthedocs.io/en/sphinx-samples/usb.html#the-usb-filesystem-usbfs).
 #![deny(rust_2018_idioms, future_incompatible, missing_docs)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::identity_conversion)] // bitflags spews this warning a lot.
+// TODO: investigate these.
+#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
 use std::ffi;
 use std::fmt;
@@ -29,7 +33,7 @@ struct CompletionSet {
 }
 impl Default for CompletionSet {
     fn default() -> Self {
-        CompletionSet {
+        Self {
             completion_seq: 0,
             completions: HashMap::new(),
         }
@@ -83,17 +87,18 @@ impl DeviceHandle {
     /// The user of the current process must have read and write access to the given file.
     ///
     /// e.g. `DeviceHandle::new_from_path("/dev/bus/usb/001/022")`
-    pub fn new_from_path(path: &Path) -> io::Result<DeviceHandle> {
+    pub fn new_from_path(path: &Path) -> io::Result<Self> {
         OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .map(|f| DeviceHandle::new(f.into_raw_fd()))
+            .map(|f| Self::new(f.into_raw_fd()))
     }
-    fn new(fd: RawFd) -> DeviceHandle {
+
+    fn new(fd: RawFd) -> Self {
         let inner = DeviceInner { fd };
         let (close_sender, close_receiver) = futures::unsync::oneshot::channel();
-        DeviceHandle(Rc::new(DevPrivate {
+        Self(Rc::new(DevPrivate {
             io: tokio::reactor::PollEvented2::new(inner),
             completions: RefCell::new(CompletionSet::default()),
             closed: RefCell::new(false),
@@ -121,14 +126,10 @@ impl DeviceHandle {
     }
 
     fn next_id(&self) -> usize {
-        match self.completions() {
-            Ok(completions) => {
-                let mut comp = completions.borrow_mut();
-                comp.completion_seq += 1;
-                comp.completion_seq
-            }
-            Err(e) => panic!("DeviceHandle already closed"),
-        }
+        let completions = self.completions().expect("DeviceHandle already closed");
+        let mut comp = completions.borrow_mut();
+        comp.completion_seq += 1;
+        comp.completion_seq
     }
 
     fn add_completion(
@@ -136,12 +137,8 @@ impl DeviceHandle {
         id: usize,
         sender: futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>,
     ) {
-        match self.completions() {
-            Ok(completions) => {
-                completions.borrow_mut().completions.insert(id, sender);
-            }
-            Err(e) => panic!("DeviceHandle already closed"),
-        }
+        let completions = self.completions().expect("DeviceHandle already closed");
+        completions.borrow_mut().completions.insert(id, sender);
     }
 
     fn capabilities(&self) -> nix::Result<Capabilities> {
@@ -171,7 +168,7 @@ impl DeviceHandle {
         nix::sys::mman::mmap(
             std::ptr::null_mut(),
             len,
-            nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_READ,
+            nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
             nix::sys::mman::MapFlags::MAP_SHARED,
             self.fd()?,
             0,
@@ -180,13 +177,12 @@ impl DeviceHandle {
 
     /// Used to 'harvest' a URB previously submitted to an endpoint pipe
     pub fn reap_ndelay(&self) -> nix::Result<UrbWrap> {
-        let mut urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
-        match unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &mut urb_p) } {
-            Err(e) => Err(e),
-            Ok(_) => Ok(UrbWrap(unsafe {
-                Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
-            })),
-        }
+        let urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &urb_p)? };
+        
+        Ok(UrbWrap(unsafe {
+            Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
+        }))
     }
 
     fn poll_reap(&self) -> futures::Poll<UrbWrap, nix::Error> {
@@ -202,7 +198,7 @@ impl DeviceHandle {
                 self.io()
                     .expect("TODO")
                     .clear_write_ready()
-                    .map_err(|e| nix::Error::Sys(nix::errno::Errno::EIO))?;
+                    .map_err(|_| nix::Error::Sys(nix::errno::Errno::EIO))?;
                 Ok(futures::Async::NotReady)
             }
             Err(e) => Err(e),
@@ -255,7 +251,7 @@ impl DeviceHandle {
                         // TODO: merge into the 'and_then()' above
                         match result {
                             Ok(dev) => futures::future::ok(futures::future::Loop::Continue(dev)),
-                            Err(e) => futures::future::ok(futures::future::Loop::Break(())),
+                            Err(_) => futures::future::ok(futures::future::Loop::Break(())),
                         }
                     })
             },
@@ -304,7 +300,7 @@ impl futures::Future for Reap {
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
         let urb = {
-            let ref mut inner = self
+            let inner = self
                 .dev
                 .as_mut()
                 .expect("RecvDgram polled after completion");
@@ -363,24 +359,22 @@ pub struct UnclaimedInterface<'dev> {
 impl<'dev> UnclaimedInterface<'dev> {
     /// returns the name of the driver currently attached to the interface.
     pub fn driver(&self) -> nix::Result<Driver> {
-        let mut driver = usbfs_sys::types::getdriver {
+        let driver = usbfs_sys::types::getdriver {
             interface: self.iface,
             driver: [0; usbfs_sys::types::MAXDRIVERNAME as usize + 1],
         };
-        match unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd()?, &mut driver) } {
-            Err(e) => Err(e),
-            Ok(_) => {
-                // TODO: safety in face of the buffer failing to contain a nul byte?
-                let driver_name = unsafe { ffi::CStr::from_ptr(driver.driver.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
-                Ok(if driver_name == "usbfs" {
-                    Driver::UsbFs
-                } else {
-                    Driver::Other(driver_name)
-                })
-            }
-        }
+
+        unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd()?, &driver)? };
+        
+        // TODO: safety in face of the buffer failing to contain a nul byte?
+        let driver_name = unsafe { ffi::CStr::from_ptr(driver.driver.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(if driver_name == "usbfs" {
+            Driver::UsbFs
+        } else {
+            Driver::Other(driver_name)
+        })
     }
 
     /// Attempt to claim this interface for use via the current device filehandle.
@@ -444,14 +438,12 @@ impl Drop for ClaimedInterface {
             // TODO: probably we do still want to release though!
             return;
         };
-        match unsafe { usbfs_sys::ioctl::releaseinterface(fd, &mut iface) } {
-            Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-            Ok(_) => (),
+        if let Err(e) = unsafe { usbfs_sys::ioctl::releaseinterface(fd, &mut iface) } {
+            eprintln!("ClaimedInterface::drop() failed: {:?}", e);
         }
         if self.reconnect == ReconnectOptions::ReconnectOnRelease {
-            match unsafe { usbfs_sys::ioctl::connect(fd, iface as i32) } {
-                Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-                Ok(_) => (),
+            if let Err(e) = unsafe { usbfs_sys::ioctl::connect(fd, iface as i32) } {
+                eprintln!("ClaimedInterface::drop() failed: {:?}", e);
             }
         }
     }
@@ -559,27 +551,24 @@ impl ControlPipe {
     ///
     /// Implemented in terms of the `USBDEVFS_SUBMITURB` ioctl.
     pub fn submit(&self, req: ControlRequest) -> impl Future<Item = UrbWrap, Error = nix::Error> {
-        futures::future::result(self.submit_internal(req)).flatten()
+        futures::future::result(self.submit_internal(&req)).flatten()
     }
 
-    fn submit_internal(&self, req: ControlRequest) -> nix::Result<ResponseFuture> {
-        if req.data.len() > std::i16::MAX as usize - SETUP_LEN {
+    fn submit_internal(&self, req: &ControlRequest) -> nix::Result<ResponseFuture> {
+        if req.data.len() > i16::max_value() as usize - SETUP_LEN {
             return Err(nix::Error::Sys(nix::errno::Errno::EINVAL));
         }
 
         let mut data = Vec::with_capacity(req.data.len() + SETUP_LEN);
-        ControlPipe::write_request(&req, &mut data);
+        Self::write_request(&req, &mut data);
         let id = self.dev.next_id();
         let request = Box::new(self.create_urb(id, data));
 
-        match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request)) } {
-            Err(e) => Err(e),
-            Ok(_) => {
-                let (sender, receiver) = futures::unsync::oneshot::channel();
-                self.dev.add_completion(id, sender);
-                Ok(ResponseFuture { receiver })
-            }
-        }
+        unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request))? };
+        
+        let (sender, receiver) = futures::unsync::oneshot::channel();
+        self.dev.add_completion(id, sender);
+        Ok(ResponseFuture { receiver })
     }
 
     fn create_urb(&self, id: usize, mut data: Vec<u8>) -> usbfs_sys::types::urb {
@@ -627,7 +616,7 @@ impl ControlPipe {
     ///
     /// *NB* this is a blocking operation.
     pub fn clear_halt(&self) -> nix::Result<()> {
-        let mut val = self.endpoint as u32;
+        let mut val = u32::from(self.endpoint);
         match unsafe { usbfs_sys::ioctl::clear_halt(self.dev.fd()?, &mut val) } {
             Err(e) => Err(e),
             Ok(_) => Ok(()),
@@ -707,13 +696,13 @@ impl Drop for UrbWrap {
 }
 bitflags::bitflags! {
     struct Capabilities: u32 {
-        const ZeroPacket = usbfs_sys::types::CAP_ZERO_PACKET;
-        const BulkContinuation = usbfs_sys::types::CAP_BULK_CONTINUATION;
-        const NoPacketSizeLim = usbfs_sys::types::CAP_NO_PACKET_SIZE_LIM;
-        const BulkScatterGather = usbfs_sys::types::CAP_BULK_SCATTER_GATHER;
-        const CapReapAfterDisconnect = usbfs_sys::types::CAP_REAP_AFTER_DISCONNECT;
-        const MMap = usbfs_sys::types::CAP_MMAP;
-        const DropPrivileges = usbfs_sys::types::CAP_DROP_PRIVILEGES;
+        const ZERO_PACKET = usbfs_sys::types::CAP_ZERO_PACKET;
+        const BULK_CONTINUATION = usbfs_sys::types::CAP_BULK_CONTINUATION;
+        const NO_PACKET_SIZE_LIMIT = usbfs_sys::types::CAP_NO_PACKET_SIZE_LIM;
+        const BULK_SCATTER_GATHER = usbfs_sys::types::CAP_BULK_SCATTER_GATHER;
+        const REAP_AFTER_DISCONNECT = usbfs_sys::types::CAP_REAP_AFTER_DISCONNECT;
+        const MMAP = usbfs_sys::types::CAP_MMAP;
+        const DROP_PRIVILEGES = usbfs_sys::types::CAP_DROP_PRIVILEGES;
     }
 }
 
@@ -723,7 +712,7 @@ mod test {
     use futures::future::Future;
     use std::path::Path;
 
-    const DEV_PATH: &str = "/dev/bus/usb/001/008";
+    const DEV_PATH: &str = "/dev/bus/usb/001/001";
 
     #[test]
     fn reset() {
