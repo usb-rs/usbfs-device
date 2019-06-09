@@ -2,12 +2,17 @@
 name = "usbfs-device"
 version = "0.1.0"
 authors = ["David Holroyd <dave@badgers-in-foil.co.uk>"]
-license = "MIT/Apache-2.0"
+license = "MIT OR Apache-2.0"
 edition = "2018"
+categories = [ "os" ]
+description = "Rust wrapper for Linux USBFS"
+documentation = "https://docs.rs/usbfs-device"
+repository = "https://github.com/usb-rs/usbfs-device"
+readme = "README.md"
 
 [dependencies]
 nix = "0.12"
-usbfs-sys = { path = "../usbfs-sys" }
+usbfs-sys = "0.1"
 bitflags = "1.0"
 byteorder = "1.2"
 mio = "0.6"

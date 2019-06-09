@@ -1,5 +1,9 @@
 //! A wrapper for the Linux [USB Filesystem](https://kernel.readthedocs.io/en/sphinx-samples/usb.html#the-usb-filesystem-usbfs).
 #![deny(rust_2018_idioms, future_incompatible, missing_docs)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::identity_conversion)] // bitflags spews this warning a lot.
+// TODO: investigate these.
+#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
 use std::ffi;
 use std::fmt;
@@ -11,9 +15,9 @@ use std::path::Path;
 //use std::cell::RefCell;
 //use std::collections::HashMap;
 use byteorder::{LittleEndian, WriteBytesExt};
+use futures::future::Future;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use futures::future::Future;
 use std::rc::Rc;
 
 // TODO: derive using bindgen?
@@ -25,17 +29,16 @@ const USB_DIR_IN: u8 = 0x80;
 struct CompletionSet {
     completion_seq: usize,
     // TODO: other containers?  e.g. slab?
-    completions: HashMap<usize, futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>>
+    completions: HashMap<usize, futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>>,
 }
 impl Default for CompletionSet {
     fn default() -> Self {
-        CompletionSet {
+        Self {
             completion_seq: 0,
             completions: HashMap::new(),
         }
     }
 }
-
 
 struct DeviceInner {
     fd: RawFd,
@@ -72,7 +75,7 @@ struct DevPrivate {
     completions: RefCell<CompletionSet>,
     closed: RefCell<bool>,
     close_sender: RefCell<Option<futures::unsync::oneshot::Sender<()>>>,
-    close_receiver: RefCell<Option<futures::unsync::oneshot::Receiver<()>>>
+    close_receiver: RefCell<Option<futures::unsync::oneshot::Receiver<()>>>,
 }
 
 /// User-space control over a particular USB device.
@@ -84,17 +87,18 @@ impl DeviceHandle {
     /// The user of the current process must have read and write access to the given file.
     ///
     /// e.g. `DeviceHandle::new_from_path("/dev/bus/usb/001/022")`
-    pub fn new_from_path(path: &Path) -> io::Result<DeviceHandle> {
+    pub fn new_from_path(path: &Path) -> io::Result<Self> {
         OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .map(|f| DeviceHandle::new(f.into_raw_fd()))
+            .map(|f| Self::new(f.into_raw_fd()))
     }
-    fn new(fd: RawFd) -> DeviceHandle {
+
+    fn new(fd: RawFd) -> Self {
         let inner = DeviceInner { fd };
         let (close_sender, close_receiver) = futures::unsync::oneshot::channel();
-        DeviceHandle(Rc::new(DevPrivate {
+        Self(Rc::new(DevPrivate {
             io: tokio::reactor::PollEvented2::new(inner),
             completions: RefCell::new(CompletionSet::default()),
             closed: RefCell::new(false),
@@ -122,23 +126,19 @@ impl DeviceHandle {
     }
 
     fn next_id(&self) -> usize {
-        match self.completions() {
-            Ok(completions) => {
-                let mut comp = completions.borrow_mut();
-                comp.completion_seq += 1;
-                comp.completion_seq
-            },
-            Err(e) => panic!("DeviceHandle already closed"),
-        }
+        let completions = self.completions().expect("DeviceHandle already closed");
+        let mut comp = completions.borrow_mut();
+        comp.completion_seq += 1;
+        comp.completion_seq
     }
 
-    fn add_completion(&self, id: usize, sender: futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>) {
-        match self.completions() {
-            Ok(completions) => {
-                completions.borrow_mut().completions.insert(id, sender);
-            },
-            Err(e) => panic!("DeviceHandle already closed"),
-        }
+    fn add_completion(
+        &self,
+        id: usize,
+        sender: futures::unsync::oneshot::Sender<nix::Result<UrbWrap>>,
+    ) {
+        let completions = self.completions().expect("DeviceHandle already closed");
+        completions.borrow_mut().completions.insert(id, sender);
     }
 
     fn capabilities(&self) -> nix::Result<Capabilities> {
@@ -168,7 +168,7 @@ impl DeviceHandle {
         nix::sys::mman::mmap(
             std::ptr::null_mut(),
             len,
-            nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_READ,
+            nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
             nix::sys::mman::MapFlags::MAP_SHARED,
             self.fd()?,
             0,
@@ -177,23 +177,28 @@ impl DeviceHandle {
 
     /// Used to 'harvest' a URB previously submitted to an endpoint pipe
     pub fn reap_ndelay(&self) -> nix::Result<UrbWrap> {
-        let mut urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
-        match unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &mut urb_p) } {
-            Err(e) => Err(e),
-            Ok(_) => Ok(UrbWrap(unsafe {
-               Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
-            })),
-        }
+        let urb_p: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { usbfs_sys::ioctl::reapurbndelay(self.fd()?, &urb_p)? };
+        
+        Ok(UrbWrap(unsafe {
+            Box::from_raw(urb_p as *mut usbfs_sys::types::urb)
+        }))
     }
 
     fn poll_reap(&self) -> futures::Poll<UrbWrap, nix::Error> {
         // oddly, we need to poll for write-readiness to determine if we can reap a URB response
-        futures::try_ready!(self.io()?.poll_write_ready().map_err(|_| nix::Error::Sys(nix::errno::Errno::EIO)));  // TODO: don't lose original error
-        // TODO: loop until EAGAIN?
+        futures::try_ready!(self
+            .io()?
+            .poll_write_ready()
+            .map_err(|_| nix::Error::Sys(nix::errno::Errno::EIO))); // TODO: don't lose original error
+                                                                    // TODO: loop until EAGAIN?
         match self.reap_ndelay() {
             Ok(ret) => Ok(futures::Async::Ready(ret)),
             Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => {
-                self.io().expect("TODO").clear_write_ready().map_err(|e| nix::Error::Sys(nix::errno::Errno::EIO))?;
+                self.io()
+                    .expect("TODO")
+                    .clear_write_ready()
+                    .map_err(|_| nix::Error::Sys(nix::errno::Errno::EIO))?;
                 Ok(futures::Async::NotReady)
             }
             Err(e) => Err(e),
@@ -207,45 +212,50 @@ impl DeviceHandle {
     /// arrange for URB completions to be handle on the event loop of the given `Runtime`.
     pub fn spawn_onto(&mut self, runtime: &mut tokio::runtime::current_thread::Runtime) {
         // TODO: return future instead, so that caller can define error handling before spawning
-        let close_receiver = self.0.close_receiver.borrow_mut().take().expect("can't spawn DeviceHandle as second time");
+        let close_receiver = self
+            .0
+            .close_receiver
+            .borrow_mut()
+            .take()
+            .expect("can't spawn DeviceHandle as second time");
         let dev = (*self).clone();
-        runtime.spawn(futures::future::loop_fn((dev, close_receiver), |(dev, close_receiver)| {
-            dev.reap()
-                .select2(close_receiver)
-                .map_err(|either| {
-                    match either {
-                        futures::future::Either::A((err, _)) => {
-                            err
-                        },
-                        futures::future::Either::B((futures::sync::oneshot::Canceled, _)) => {
-                            // Fake-up an error to cause the Loop::Break varient to get produced
-                            // below, ending the stream
-                            nix::Error::Sys(nix::errno::Errno::EIO)
-                        },
-                    }
-
-                })
-                .and_then(|either| {
-                    match either {
-                        futures::future::Either::A(((urb, dev), close_receiver)) => {
-                            dev.dispatch(urb).expect("TODO: dispatch() failed");
-                            futures::future::ok((dev, close_receiver))
-                        },
-                        futures::future::Either::B(((), _)) => {
-                            // Fake-up an error to cause the Loop::Break varient to get produced
-                            // below, ending the stream
-                            futures::future::err(nix::Error::Sys(nix::errno::Errno::EIO))
-                        },
-                    }
-                })
-                .then(|result| {
-                    // TODO: merge into the 'and_then()' above
-                    match result {
-                        Ok(dev) => futures::future::ok(futures::future::Loop::Continue(dev)),
-                        Err(e) => futures::future::ok(futures::future::Loop::Break(())),
-                    }
-                })
-        }));
+        runtime.spawn(futures::future::loop_fn(
+            (dev, close_receiver),
+            |(dev, close_receiver)| {
+                dev.reap()
+                    .select2(close_receiver)
+                    .map_err(|either| {
+                        match either {
+                            futures::future::Either::A((err, _)) => err,
+                            futures::future::Either::B((futures::sync::oneshot::Canceled, _)) => {
+                                // Fake-up an error to cause the Loop::Break varient to get produced
+                                // below, ending the stream
+                                nix::Error::Sys(nix::errno::Errno::EIO)
+                            }
+                        }
+                    })
+                    .and_then(|either| {
+                        match either {
+                            futures::future::Either::A(((urb, dev), close_receiver)) => {
+                                dev.dispatch(urb).expect("TODO: dispatch() failed");
+                                futures::future::ok((dev, close_receiver))
+                            }
+                            futures::future::Either::B(((), _)) => {
+                                // Fake-up an error to cause the Loop::Break varient to get produced
+                                // below, ending the stream
+                                futures::future::err(nix::Error::Sys(nix::errno::Errno::EIO))
+                            }
+                        }
+                    })
+                    .then(|result| {
+                        // TODO: merge into the 'and_then()' above
+                        match result {
+                            Ok(dev) => futures::future::ok(futures::future::Loop::Continue(dev)),
+                            Err(_) => futures::future::ok(futures::future::Loop::Break(())),
+                        }
+                    })
+            },
+        ));
     }
 
     fn dispatch(&self, urb: UrbWrap) -> nix::Result<()> {
@@ -253,16 +263,16 @@ impl DeviceHandle {
         let id = urb.id();
         let result = match urb.0.status {
             0 => Ok(urb),
-            e => Err(nix::Error::Sys(nix::errno::Errno::from_i32(e)))
+            e => Err(nix::Error::Sys(nix::errno::Errno::from_i32(e))),
         };
         match completions.borrow_mut().completions.remove(&id) {
             Some(c) => {
-                c.send(result).expect("Failed to send completed URB to handling Future");
+                c.send(result)
+                    .expect("Failed to send completed URB to handling Future");
                 Ok(())
-            },
+            }
             None => panic!("No completion for id {}", id),
         }
-
     }
 
     fn fd(&self) -> nix::Result<RawFd> {
@@ -290,7 +300,7 @@ impl futures::Future for Reap {
 
     fn poll(&mut self) -> Result<futures::Async<Self::Item>, Self::Error> {
         let urb = {
-            let ref mut inner = self
+            let inner = self
                 .dev
                 .as_mut()
                 .expect("RecvDgram polled after completion");
@@ -349,24 +359,22 @@ pub struct UnclaimedInterface<'dev> {
 impl<'dev> UnclaimedInterface<'dev> {
     /// returns the name of the driver currently attached to the interface.
     pub fn driver(&self) -> nix::Result<Driver> {
-        let mut driver = usbfs_sys::types::getdriver {
+        let driver = usbfs_sys::types::getdriver {
             interface: self.iface,
             driver: [0; usbfs_sys::types::MAXDRIVERNAME as usize + 1],
         };
-        match unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd()?, &mut driver) } {
-            Err(e) => Err(e),
-            Ok(_) => {
-                // TODO: safety in face of the buffer failing to contain a nul byte?
-                let driver_name = unsafe { ffi::CStr::from_ptr(driver.driver.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
-                Ok(if driver_name == "usbfs" {
-                    Driver::UsbFs
-                } else {
-                    Driver::Other(driver_name)
-                })
-            }
-        }
+
+        unsafe { usbfs_sys::ioctl::getdriver(self.dev.fd()?, &driver)? };
+        
+        // TODO: safety in face of the buffer failing to contain a nul byte?
+        let driver_name = unsafe { ffi::CStr::from_ptr(driver.driver.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(if driver_name == "usbfs" {
+            Driver::UsbFs
+        } else {
+            Driver::Other(driver_name)
+        })
     }
 
     /// Attempt to claim this interface for use via the current device filehandle.
@@ -430,16 +438,13 @@ impl Drop for ClaimedInterface {
             // TODO: probably we do still want to release though!
             return;
         };
-        match unsafe { usbfs_sys::ioctl::releaseinterface(fd, &mut iface) } {
-            Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-            Ok(_) => (),
+        if let Err(e) = unsafe { usbfs_sys::ioctl::releaseinterface(fd, &mut iface) } {
+            eprintln!("ClaimedInterface::drop() failed: {:?}", e);
         }
         if self.reconnect == ReconnectOptions::ReconnectOnRelease {
-            match unsafe { usbfs_sys::ioctl::connect(fd, iface as i32) } {
-                Err(e) => eprintln!("ClaimedInterface::drop() failed: {:?}", e),
-                Ok(_) => (),
+            if let Err(e) = unsafe { usbfs_sys::ioctl::connect(fd, iface as i32) } {
+                eprintln!("ClaimedInterface::drop() failed: {:?}", e);
             }
-
         }
     }
 }
@@ -545,36 +550,25 @@ impl ControlPipe {
     /// TODO: In order to see the result, ...
     ///
     /// Implemented in terms of the `USBDEVFS_SUBMITURB` ioctl.
-    pub fn submit(
-        &self,
-        req: ControlRequest,
-    ) -> impl Future<Item=UrbWrap, Error=nix::Error>
-    {
-        futures::future::result(self.submit_internal(req)).flatten()
+    pub fn submit(&self, req: ControlRequest) -> impl Future<Item = UrbWrap, Error = nix::Error> {
+        futures::future::result(self.submit_internal(&req)).flatten()
     }
 
-    fn submit_internal(
-        &self,
-        req: ControlRequest,
-    ) -> nix::Result<ResponseFuture>
-    {
-        if req.data.len() > std::i16::MAX as usize - SETUP_LEN {
+    fn submit_internal(&self, req: &ControlRequest) -> nix::Result<ResponseFuture> {
+        if req.data.len() > i16::max_value() as usize - SETUP_LEN {
             return Err(nix::Error::Sys(nix::errno::Errno::EINVAL));
         }
 
         let mut data = Vec::with_capacity(req.data.len() + SETUP_LEN);
-        ControlPipe::write_request(&req, &mut data);
+        Self::write_request(&req, &mut data);
         let id = self.dev.next_id();
         let request = Box::new(self.create_urb(id, data));
 
-        match unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request)) } {
-            Err(e) => Err(e),
-            Ok(_) => {
-                let (sender, receiver) = futures::unsync::oneshot::channel();
-                self.dev.add_completion(id, sender);
-                Ok(ResponseFuture { receiver })
-            },
-        }
+        unsafe { usbfs_sys::ioctl::submiturb(self.dev.fd()?, Box::into_raw(request))? };
+        
+        let (sender, receiver) = futures::unsync::oneshot::channel();
+        self.dev.add_completion(id, sender);
+        Ok(ResponseFuture { receiver })
     }
 
     fn create_urb(&self, id: usize, mut data: Vec<u8>) -> usbfs_sys::types::urb {
@@ -622,7 +616,7 @@ impl ControlPipe {
     ///
     /// *NB* this is a blocking operation.
     pub fn clear_halt(&self) -> nix::Result<()> {
-        let mut val = self.endpoint as u32;
+        let mut val = u32::from(self.endpoint);
         match unsafe { usbfs_sys::ioctl::clear_halt(self.dev.fd()?, &mut val) } {
             Err(e) => Err(e),
             Ok(_) => Ok(()),
@@ -643,9 +637,9 @@ impl futures::Future for ResponseFuture {
             Ok(futures::Async::Ready(urb_result)) => match urb_result {
                 Ok(urb) => Ok(futures::Async::Ready(urb)),
                 Err(e) => Err(e),
-            }
+            },
             Ok(futures::Async::NotReady) => Ok(futures::Async::NotReady),
-            Err(e) => panic!("onshot cancelled: {:?}", e),  // TODO: don't panic if can really happen
+            Err(e) => panic!("onshot cancelled: {:?}", e), // TODO: don't panic if can really happen
         }
     }
 }
@@ -685,7 +679,7 @@ impl UrbWrap {
     /// The payload part of the data buffer (after the SETUP headers, restricted to the actual
     /// length returned in the device response)
     pub fn payload(&self) -> &[u8] {
-        &self.data()[SETUP_LEN..SETUP_LEN+self.0.actual_length as usize]
+        &self.data()[SETUP_LEN..SETUP_LEN + self.0.actual_length as usize]
     }
 }
 impl Drop for UrbWrap {
@@ -702,13 +696,13 @@ impl Drop for UrbWrap {
 }
 bitflags::bitflags! {
     struct Capabilities: u32 {
-        const ZeroPacket = usbfs_sys::types::CAP_ZERO_PACKET;
-        const BulkContinuation = usbfs_sys::types::CAP_BULK_CONTINUATION;
-        const NoPacketSizeLim = usbfs_sys::types::CAP_NO_PACKET_SIZE_LIM;
-        const BulkScatterGather = usbfs_sys::types::CAP_BULK_SCATTER_GATHER;
-        const CapReapAfterDisconnect = usbfs_sys::types::CAP_REAP_AFTER_DISCONNECT;
-        const MMap = usbfs_sys::types::CAP_MMAP;
-        const DropPrivileges = usbfs_sys::types::CAP_DROP_PRIVILEGES;
+        const ZERO_PACKET = usbfs_sys::types::CAP_ZERO_PACKET;
+        const BULK_CONTINUATION = usbfs_sys::types::CAP_BULK_CONTINUATION;
+        const NO_PACKET_SIZE_LIMIT = usbfs_sys::types::CAP_NO_PACKET_SIZE_LIM;
+        const BULK_SCATTER_GATHER = usbfs_sys::types::CAP_BULK_SCATTER_GATHER;
+        const REAP_AFTER_DISCONNECT = usbfs_sys::types::CAP_REAP_AFTER_DISCONNECT;
+        const MMAP = usbfs_sys::types::CAP_MMAP;
+        const DROP_PRIVILEGES = usbfs_sys::types::CAP_DROP_PRIVILEGES;
     }
 }
 
@@ -718,7 +712,7 @@ mod test {
     use futures::future::Future;
     use std::path::Path;
 
-    const DEV_PATH: &str = "/dev/bus/usb/001/008";
+    const DEV_PATH: &str = "/dev/bus/usb/001/001";
 
     #[test]
     fn reset() {
@@ -778,8 +772,7 @@ mod test {
 
     #[test]
     fn future() {
-        let mut runtime = tokio::runtime::current_thread::Runtime::new()
-            .unwrap();
+        let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
 
         let mut dev = DeviceHandle::new_from_path(Path::new(DEV_PATH)).unwrap();
         dev.spawn_onto(&mut runtime);
@@ -813,9 +806,10 @@ mod test {
             .then(move |_| {
                 dev.close();
                 Ok(())
-            } );
+            });
 
-        runtime.spawn(response)
+        runtime
+            .spawn(response)
             .run()
             .expect("failure running spawned Future");
     }
